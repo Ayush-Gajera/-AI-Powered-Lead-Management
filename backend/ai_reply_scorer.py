@@ -1,25 +1,12 @@
 """
-AI Reply Scorer using Google Gemini Flash 2.0
+AI Reply Scorer using OpenRouter API
 Analyzes email replies and returns scoring, priority, and intent
 """
-import os
 import json
 import re
 from typing import Dict, Optional
-from dotenv import load_dotenv
-import google.generativeai as genai
 from pydantic import BaseModel, Field
-
-load_dotenv()
-
-# Gemini Configuration
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-exp")
-
-# Configure Gemini
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-
+from ai_provider import call_ai_model
 
 class ReplyScoring(BaseModel):
     """AI scoring response model"""
@@ -56,126 +43,61 @@ def clean_reply_text(reply_text: str) -> str:
     return cleaned_text[:2000]
 
 
-def extract_json_from_response(response_text: str) -> Optional[Dict]:
+def score_reply_with_ai_model(reply_text: str) -> Optional[ReplyScoring]:
     """
-    Extract JSON block from Gemini response
-    Handles cases where Gemini adds extra text around JSON
-    """
-    # Try to find JSON block in markdown code fence
-    json_match = re.search(r'```(?:json)?\s*(\{.+?\})\s*```', response_text, re.DOTALL)
-    if json_match:
-        try:
-            return json.loads(json_match.group(1))
-        except json.JSONDecodeError:
-            pass
-    
-    # Try to find raw JSON object
-    json_match = re.search(r'\{[\s\S]*\}', response_text)
-    if json_match:
-        try:
-            return json.loads(json_match.group(0))
-        except json.JSONDecodeError:
-            pass
-    
-    # Try to parse entire response as JSON
-    try:
-        return json.loads(response_text)
-    except json.JSONDecodeError:
-        return None
-
-
-def score_reply_with_gemini(reply_text: str) -> Optional[ReplyScoring]:
-    """
-    Score reply using Google Gemini Flash 2.0
+    Score reply using OpenRouter AI
     Returns ReplyScoring object or None if failed
     """
-    if not GEMINI_API_KEY:
-        print("Warning: GEMINI_API_KEY not configured, using fallback scoring")
-        return None
-    
     try:
         # Clean the reply text
         cleaned_text = clean_reply_text(reply_text)
         
         # Construct the prompt
-        prompt = f"""You are an expert sales assistant. Analyze the following email reply and decide if it is a valuable lead reply.
-
-Return ONLY valid JSON with this schema:
-{{
-"reply_score": number (0-100),
-"priority": "HIGH" | "MEDIUM" | "LOW" | "IGNORE",
-"intent": "INTERESTED" | "ASKING_PRICE" | "MEETING" | "NOT_INTERESTED" | "UNSUBSCRIBE" | "SPAM" | "OTHER",
-"confidence": number (0.0-1.0),
-"reasons": string[]
-}}
-
-Rules:
-- HIGH (80-100): wants pricing, demo, meeting, ready to buy, urgent.
-- MEDIUM (50-79): asks for details, maybe later, needs follow-up.
-- LOW (20-49): vague reply, not clear intent.
-- IGNORE (0-19): unsubscribe, spam, abusive, irrelevant.
-
-If the reply contains unsubscribe request → priority must be IGNORE and score <= 10.
-If the reply says not interested → priority LOW or IGNORE depending on tone.
-
-Be concise. Reasons must be short bullet-like strings.
-
-Now analyze this email reply:
-{cleaned_text}"""
-
-        # Initialize model
-        model = genai.GenerativeModel(GEMINI_MODEL)
+        system_prompt = """
+        You are an expert sales assistant. Analyze the incoming email reply and determine its value.
         
-        # Configure generation with timeout
-        generation_config = {
-            "temperature": 0.3,  # Lower temperature for more consistent output
-            "top_p": 0.95,
-            "top_k": 40,
-            "max_output_tokens": 500,
-        }
+        Output Guide:
+        - reply_score: 0-100
+        - priority: HIGH (ready to buy/meet), MEDIUM (questions), LOW (not interested), IGNORE (spam/unsubscribe)
+        - intent: INTERESTED, ASKING_PRICE, MEETING, NOT_INTERESTED, UNSUBSCRIBE, SPAM, OTHER
+        - confidence: 0.0-1.0
+        - reasons: List of short strings explaining why
         
-        # Generate response with retry logic
-        max_retries = 2
-        for attempt in range(max_retries + 1):
-            try:
-                response = model.generate_content(
-                    prompt,
-                    generation_config=generation_config,
-                    request_options={"timeout": 10}  # 10 second timeout
-                )
-                
-                # Extract text from response
-                response_text = response.text
-                
-                # Extract JSON from response
-                json_data = extract_json_from_response(response_text)
-                
-                if json_data:
-                    # Validate and parse with Pydantic
-                    scoring = ReplyScoring(**json_data)
-                    return scoring
-                else:
-                    print(f"Warning: Could not extract JSON from Gemini response (attempt {attempt + 1})")
-                    if attempt < max_retries:
-                        continue
-                    return None
-                    
-            except Exception as e:
-                print(f"Error calling Gemini API (attempt {attempt + 1}): {str(e)}")
-                if attempt < max_retries:
-                    continue
-                return None
+        Rules:
+        - Unsubscribe/Remove me -> IGNORE, Score <= 10
+        - Not interested -> LOW
+        - Pricing/Meeting -> HIGH
         
-        return None
+        Reply ONLY in JSON format matching the schema.
+        """
+        
+        user_prompt = f"""
+        Analyze this email reply:
+        "{cleaned_text}"
+        """
+
+        # Call AI
+        response_text = call_ai_model(
+            prompt=user_prompt,
+            system_message=system_prompt,
+            json_mode=True
+        )
+        
+        # Parse JSON
+        data = json.loads(response_text)
+        scoring = ReplyScoring(**data)
+        
+        print(f"✓ AI Scoring: {scoring.priority} ({scoring.reply_score}) - {scoring.intent}")
+        return scoring
         
     except Exception as e:
-        print(f"Error in score_reply_with_gemini: {str(e)}")
+        print(f"❌ AI Scoring Failed: {str(e)}")
         return None
 
 
 def rule_based_score_reply(reply_text: str) -> ReplyScoring:
     """
-    Fallback rule-based scoring when Gemini is unavailable
+    Fallback rule-based scoring when AI is unavailable
     """
     text_lower = reply_text.lower()
     score = 50
@@ -257,14 +179,13 @@ def rule_based_score_reply(reply_text: str) -> ReplyScoring:
 
 def score_reply_with_ai(reply_text: str) -> ReplyScoring:
     """
-    Main function to score reply with AI (Gemini) or fallback to rules
+    Main function to score reply with AI or fallback to rules
     """
-    # Try Gemini first
-    gemini_result = score_reply_with_gemini(reply_text)
+    # Try AI first
+    ai_result = score_reply_with_ai_model(reply_text)
     
-    if gemini_result:
-        print(f"✓ Gemini scoring successful: {gemini_result.priority} ({gemini_result.reply_score})")
-        return gemini_result
+    if ai_result:
+        return ai_result
     
     # Fallback to rule-based
     print("⚠ Using fallback rule-based scoring")
